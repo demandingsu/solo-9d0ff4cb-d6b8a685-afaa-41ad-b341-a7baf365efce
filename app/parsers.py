@@ -16,6 +16,7 @@ LIBRARY_ALIASES = {
 }
 VOLUME_ALIASES = {
     "glyph_char": ("字", "用字", "字符", "glyph", "char", "character"),
+    "page_no": ("页码", "页", "页号", "page", "page_no", "pageno"),
 }
 
 
@@ -56,6 +57,31 @@ class LibraryRow:
 @dataclass
 class VolumeRow:
     glyph_char: str
+
+
+@dataclass
+class VolumeTable:
+    """分册用字表解析结果。
+
+    chars     按文件顺序去重后的用字清单（交印时逐字解析字模）。
+    page_rows (页码, 字) 逐行记录（文件顺序、已去重）；为空表示无页码用字表。
+    """
+
+    chars: list[str]
+    page_rows: list[tuple[str, str]]
+
+    @property
+    def paged(self) -> bool:
+        return bool(self.page_rows)
+
+    def page_map(self) -> dict[str, list[str]]:
+        """字 -> 该字出现的页码（按文件顺序去重）。"""
+        pages: dict[str, list[str]] = {}
+        for page_no, ch in self.page_rows:
+            bucket = pages.setdefault(ch, [])
+            if page_no not in bucket:
+                bucket.append(page_no)
+        return pages
 
 
 def parse_library_csv(data: bytes) -> list[LibraryRow]:
@@ -102,8 +128,14 @@ def parse_library_csv(data: bytes) -> list[LibraryRow]:
     return rows
 
 
-def parse_volume_csv(data: bytes) -> list[str]:
-    """返回按文件顺序去重后的用字列表。"""
+def parse_volume_csv(data: bytes) -> VolumeTable:
+    """解析分册用字表。
+
+    支持两种格式：
+    - 无页码：只有“字”列（或干脆无表头、每行一个字）；
+    - 带页码：表头含「页码、字」两列，逐行记录每个字所在页；
+      字格内可连写多字（同页），同一 (页码, 字) 重复出现只记一次。
+    """
     text = decode_bytes(data)
     reader = csv.reader(io.StringIO(text))
     try:
@@ -111,6 +143,9 @@ def parse_volume_csv(data: bytes) -> list[str]:
     except StopIteration:
         raise DomainError("用字表为空")
     mapping = _map_headers(header, VOLUME_ALIASES)
+    paged = "page_no" in mapping
+    if paged and "glyph_char" not in mapping:
+        raise DomainError("用字表带“页码”列时还必须包含“字”列")
     if "glyph_char" not in mapping:
         # 兼容无表头、每行一个字的写法
         chars: list[str] = []
@@ -120,17 +155,33 @@ def parse_volume_csv(data: bytes) -> list[str]:
                 chars.extend(list(token.replace(" ", "")))
         if not chars:
             raise DomainError("用字表为空，或缺少“字/字符”列")
+        page_rows: list[tuple[str, str]] = []
     else:
         idx = mapping["glyph_char"]
+        page_idx = mapping.get("page_no")
         chars = []
+        page_rows = []
+        seen_page_row: set[tuple[str, str]] = set()
         for line_no, raw in enumerate(reader, start=2):
             if not raw or all(not c.strip() for c in raw):
                 continue
+            if idx >= len(raw):
+                raise DomainError(f"用字表第 {line_no} 行列数不足")
             token = raw[idx].strip()
             if not token:
                 continue
-            # 单元格内允许多个字连写
-            chars.extend(list(token.replace(" ", "")))
+            row_chars = list(token.replace(" ", ""))
+            chars.extend(row_chars)
+            if paged:
+                page_no = (raw[page_idx].strip() if page_idx is not None
+                           and page_idx < len(raw) else "")
+                if not page_no:
+                    raise DomainError(f"用字表第 {line_no} 行页码为空")
+                for ch in row_chars:
+                    key = (page_no, ch)
+                    if key not in seen_page_row:
+                        seen_page_row.add(key)
+                        page_rows.append((page_no, ch))
     ordered: list[str] = []
     seen: set[str] = set()
     for ch in chars:
@@ -139,4 +190,4 @@ def parse_volume_csv(data: bytes) -> list[str]:
             ordered.append(ch)
     if not ordered:
         raise DomainError("用字表没有任何字")
-    return ordered
+    return VolumeTable(chars=ordered, page_rows=page_rows)

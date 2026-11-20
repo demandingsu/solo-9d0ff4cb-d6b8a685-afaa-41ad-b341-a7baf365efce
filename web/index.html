@@ -33,6 +33,8 @@
   .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
   .tag.add { background:#e3f2e8; color:var(--green); }
   .tag.del { background:#fbe5e2; color:var(--red); }
+  .tag.unk { background:#f3ead8; color:#8a6d2b; }
+  .tag.pg  { background:#e7eef7; color:#2b5a8a; }
   .muted { color:var(--sub); font-size:12px; }
   .msg { margin-top:10px; padding:10px; border-radius:5px; font-size:13px;
          white-space:pre-wrap; display:none; }
@@ -51,7 +53,7 @@
 <body>
 <header>
   <h1>古籍制版 · 字模工位管理</h1>
-  <p>分册用字表 × 优先字库清单 · 每字取第一个收录它的字库 · 交印逐单出增减单 · 原单可重取</p>
+  <p>分册用字表（可带页码）× 优先字库清单 · 每字取第一个收录它的字库 · 交印逐单出增减单 · 逐页用模随单入档 · 按字模回查页码</p>
 </header>
 <main>
   <div>
@@ -66,9 +68,10 @@
 
     <div class="card">
       <h2>② 分册用字表</h2>
-      <p class="muted">CSV 列：字（可多行）。全量替换该册用字。
+      <p class="muted">CSV 列：字（可多行）；或 <b>页码,字</b> 两列（逐页记录用字，字格可连写多字）。全量替换该册用字。
         <a href="/samples/volume_a.csv" target="_blank">样例册甲</a> ·
-        <a href="/samples/volume_b.csv" target="_blank">样例册乙</a></p>
+        <a href="/samples/volume_b.csv" target="_blank">样例册乙</a> ·
+        <a href="/samples/volume_a_paged.csv" target="_blank">带页码册甲</a></p>
       <label>册名</label>
       <input type="text" id="volName" placeholder="例如：册甲">
       <label>用字表 CSV</label>
@@ -94,6 +97,21 @@
       <button class="ghost" onclick="fetchOrder()">查看 JSON</button>
       <button class="ghost" onclick="downloadOrder()">下载 CSV</button>
       <div id="orderMsg" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2>⑤ 字模回查（字模缺损时查哪些单要重做）</h2>
+      <p class="muted">按 字库＋版次＋字模号 回查，列出用过该字模的交印单、册名与页码；
+        无页码单标“页码未知”。在右侧状态面板点字模可自动填入。</p>
+      <label>字库</label>
+      <input type="text" id="lkLib" placeholder="例如：宋韵楼">
+      <label>版次</label>
+      <input type="text" id="lkEdition" placeholder="例如：初刻">
+      <label>字模号</label>
+      <input type="text" id="lkMatrix" placeholder="例如：SR-A001">
+      <button onclick="lookupMatrix()">回查</button>
+      <div id="lookupMsg" class="msg"></div>
+      <div id="lookupBox"></div>
     </div>
 
     <div class="card">
@@ -148,7 +166,8 @@ async function uploadVol() {
   const fd = new FormData(); fd.append("file", f);
   try {
     const d = await post(`/api/volumes/${encodeURIComponent(name)}/chars`, fd);
-    show("volMsg", `册「${d.volume}」用字表已更新，共 ${d.char_count} 个字`, true);
+    show("volMsg", `册「${d.volume}」用字表已更新，共 ${d.char_count} 个字` +
+      (d.paged ? `，含 ${d.page_count} 个页码` : "（无页码）"), true);
     loadState();
   } catch (e) { show("volMsg", e.message, false); }
 }
@@ -190,35 +209,78 @@ function downloadOrder() {
   if (!no) return show("orderMsg", "请填写单号", false);
   window.open(`/api/orders/${encodeURIComponent(no)}/download`, "_blank");
 }
+function fillLookup(lib, edition, matrixNo) {
+  document.getElementById("lkLib").value = lib;
+  document.getElementById("lkEdition").value = edition;
+  document.getElementById("lkMatrix").value = matrixNo;
+  lookupMatrix();
+}
+async function lookupMatrix() {
+  const lib = document.getElementById("lkLib").value.trim();
+  const ed = document.getElementById("lkEdition").value.trim();
+  const no = document.getElementById("lkMatrix").value.trim();
+  const box = document.getElementById("lookupBox");
+  if (!lib || !ed || !no) return show("lookupMsg", "请填齐 字库、版次、字模号", false);
+  try {
+    const resp = await fetch(`/api/lookup?library=${encodeURIComponent(lib)}` +
+      `&edition=${encodeURIComponent(ed)}&matrix_no=${encodeURIComponent(no)}`);
+    const d = await resp.json();
+    if (!resp.ok) throw new Error(d.error);
+    const head = `字模 ${lib}/${ed}/${no}` +
+      (d.glyph_char ? `（字：${d.glyph_char}）` : "") +
+      `：共 ${d.match_count} 笔交印单用过` +
+      (d.in_current_library ? "" : "；该字模已不在当前生效字库");
+    show("lookupMsg", head, true);
+    if (!d.matches.length) { box.innerHTML = ""; return; }
+    let html = "<table><tr><th>生效序</th><th>单号</th><th>册名</th><th>页码</th></tr>";
+    for (const m of d.matches) {
+      const pages = m.pages_unknown
+        ? '<span class="tag unk">页码未知</span>'
+        : m.pages.map(p => `<span class="tag pg">${p}</span>`).join(" ");
+      html += `<tr><td>${m.seq}</td><td><a href="javascript:void(0)" ` +
+        `onclick="document.getElementById('orderNo').value='${m.order_no}';fetchOrder()">` +
+        `${m.order_no}</a></td><td>${m.volume}</td><td>${pages}</td></tr>`;
+    }
+    box.innerHTML = html + "</table>";
+  } catch (e) { show("lookupMsg", e.message, false); box.innerHTML = ""; }
+}
 async function resetAll() {
   await fetch("/api/reset", { method:"POST" });
   loadState(); loadOrders();
 }
 function ident(x) { return `${x.glyph_char}（${x.library_name}/${x.edition}/${x.matrix_no}）`; }
+function identLink(x) {
+  return `<a href="javascript:void(0)" title="点击回查该字模" ` +
+    `onclick='fillLookup(${JSON.stringify(x.library_name)},${JSON.stringify(x.edition)},` +
+    `${JSON.stringify(x.matrix_no)})'>${ident(x)}</a>`;
+}
 async function loadState() {
   const d = await (await fetch("/api/state")).json();
   const box = document.getElementById("stateBox");
   let html = `<p class="muted">当前生效字库：${d.libraries.map(l =>
       `${l.name}·${l.edition}(优先级${l.priority})`).join(" → ") || "（未上传）"}</p>`;
   for (const v of d.volumes) {
-    html += `<div class="vol"><h3>册「${v.volume}」</h3>
-      <div class="chars">用字：${v.chars.join("")}</div>
+    const chars = v.chars.map(c =>
+      (v.char_pages && v.char_pages[c]) ? `${c}〔${v.char_pages[c].join("·")}〕` : c).join("");
+    html += `<div class="vol"><h3>册「${v.volume}」${v.paged ? '<span class="tag pg">带页码</span>' : ""}</h3>
+      <div class="chars">用字：${chars}</div>
       <div class="muted">已交印字模 ${v.active_matrices.length} 个：${
         v.active_matrices.map(ident).join("；") || "（尚未交印）"}</div></div>`;
   }
-  html += `<p><b>各册共需字模并集（${d.shared_pool.length} 个）：</b><br>` +
-    d.shared_pool.map(ident).join("；") + "</p>";
+  html += `<p><b>各册共需字模并集（${d.shared_pool.length} 个，点击可回查）：</b><br>` +
+    d.shared_pool.map(identLink).join("；") + "</p>";
   box.innerHTML = html || "<p class='muted'>暂无数据。</p>";
 }
 async function loadOrders() {
   const d = await (await fetch("/api/orders")).json();
   const box = document.getElementById("ordersBox");
   if (!d.length) { box.innerHTML = "<p class='muted'>暂无。</p>"; return; }
-  let html = "<table><tr><th>生效序</th><th>单号</th><th>册</th><th>增</th><th>减</th><th>操作</th></tr>";
+  let html = "<table><tr><th>生效序</th><th>单号</th><th>册</th><th>增</th><th>减</th><th>页</th><th>操作</th></tr>";
   for (const o of d) {
     html += `<tr><td>${o.seq}</td><td>${o.order_no}</td><td>${o.volume}</td>
       <td><span class="tag add">+${o.added_count}</span></td>
       <td><span class="tag del">-${o.removed_count}</span></td>
+      <td>${o.has_pages ? '<span class="tag pg">页</span>' : '<span class="tag unk">无页</span>'}</td>
       <td><a href="/api/orders/${o.order_no}/download">CSV</a> ·
       <a href="javascript:void(0)" onclick="document.getElementById('orderNo').value='${o.order_no}';fetchOrder()">JSON</a></td></tr>`;
   }

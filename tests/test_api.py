@@ -303,3 +303,217 @@ def test_bad_csv_headers(client):
         files={"file": ("x.csv", _csv("foo,bar\n1,2\n"), "text/csv")},
     )
     assert r.status_code == 400 and "缺少必需列" in r.json()["error"]
+
+
+# ---------- 带页码用字表：解析、交印入档、按字模回查 ----------
+
+
+def _upload_vol_paged(client, name: str, rows: list[tuple[str, str]]):
+    body = "页码,字\n" + "\n".join(f"{p},{c}" for p, c in rows) + "\n"
+    return client.post(
+        f"/api/volumes/{name}/chars",
+        files={"file": (f"{name}.csv", _csv(body), "text/csv")},
+    )
+
+
+def _lib3(client):
+    r = _upload_lib(client, [
+        ("宋韵楼", "初刻", "SR-1", "天"),
+        ("宋韵楼", "初刻", "SR-2", "地"),
+        ("宋韵楼", "初刻", "SR-3", "人"),
+    ])
+    assert r.status_code == 200, r.text
+
+
+def _lookup(client, lib="宋韵楼", edition="初刻", no="SR-1"):
+    r = client.get(f"/api/lookup?library={lib}&edition={edition}&matrix_no={no}")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_paged_upload_submit_and_lookup(client):
+    _lib3(client)
+    # 带「页码、字」两列上传；字格连写多字、同字跨页
+    r = _upload_vol_paged(client, "册甲", [("一", "天地"), ("二", "人"), ("三", "天")])
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["char_count"] == 3 and d["paged"] is True and d["page_count"] == 3
+
+    o = client.post("/api/volumes/册甲/submit").json()
+    assert o["has_pages"] is True
+    # 逐页记录随单入档：页一 天/地、页二 人、页三 天
+    pages = {pg["page_no"]: {x["glyph_char"] for x in pg["items"]} for pg in o["pages"]}
+    assert pages == {"一": {"天", "地"}, "二": {"人"}, "三": {"天"}}
+    # 按单号重取，逐页记录原样还在
+    again = client.get(f"/api/orders/{o['order_no']}").json()
+    assert again["pages"] == o["pages"]
+
+    # 回查“天”的字模 → 该单、册甲、页一/三
+    lk = _lookup(client, no="SR-1")
+    assert lk["glyph_char"] == "天" and lk["match_count"] == 1
+    m = lk["matches"][0]
+    assert m["order_no"] == o["order_no"] and m["volume"] == "册甲"
+    assert m["pages"] == ["一", "三"] and m["pages_unknown"] is False
+    # 回查“人”的字模 → 页二
+    lk3 = _lookup(client, no="SR-3")
+    assert lk3["matches"][0]["pages"] == ["二"]
+
+
+def test_pageless_order_listed_as_pages_unknown(client):
+    _lib3(client)
+    _upload_vol(client, "册甲", "天地")          # 无页码用字表
+    o1 = client.post("/api/volumes/册甲/submit").json()
+    assert o1["has_pages"] is False and o1["pages"] is None
+
+    _upload_vol_paged(client, "册乙", [("五", "天")])  # 带页码
+    o2 = client.post("/api/volumes/册乙/submit").json()
+
+    lk = _lookup(client, no="SR-1")
+    assert lk["match_count"] == 2
+    by_vol = {m["volume"]: m for m in lk["matches"]}
+    # 无页码单也列出，标为页码未知
+    assert by_vol["册甲"]["pages"] is None and by_vol["册甲"]["pages_unknown"] is True
+    assert by_vol["册乙"]["pages"] == ["五"] and by_vol["册乙"]["pages_unknown"] is False
+
+
+def test_page_change_issues_new_order_even_same_matrices(client):
+    _lib3(client)
+    _upload_vol_paged(client, "册甲", [("一", "天"), ("二", "地")])
+    o1 = client.post("/api/volumes/册甲/submit").json()
+
+    # 换页：用字与用模完全不变，仅“地”从页二改到页三 → 必须出新单
+    _upload_vol_paged(client, "册甲", [("一", "天"), ("三", "地")])
+    o2 = client.post("/api/volumes/册甲/submit").json()
+    assert o2["order_no"] != o1["order_no"] and o2["reused"] is False
+    assert o2["added"] == [] and o2["removed"] == []          # 共需池无增减
+    assert o2["volume_before"] == o2["volume_after"]          # 用模相同
+    pages = {pg["page_no"]: [x["glyph_char"] for x in pg["items"]] for pg in o2["pages"]}
+    assert pages == {"一": ["天"], "三": ["地"]}
+
+    # 回查“地”：新旧两单各自页码都在档
+    lk = _lookup(client, no="SR-2")
+    assert [m["pages"] for m in lk["matches"]] == [["二"], ["三"]]
+
+    # 稿件与用模都未再变 → 复用原单
+    o3 = client.post("/api/volumes/册甲/submit").json()
+    assert o3["order_no"] == o2["order_no"] and o3["reused"] is True
+
+
+def test_add_or_drop_pages_counts_as_change(client):
+    _lib3(client)
+    _upload_vol(client, "册甲", "天地")                       # 无页码
+    o1 = client.post("/api/volumes/册甲/submit").json()
+
+    # 补上页码（用字、用模不变）→ 新单
+    _upload_vol_paged(client, "册甲", [("一", "天"), ("一", "地")])
+    o2 = client.post("/api/volumes/册甲/submit").json()
+    assert o2["order_no"] != o1["order_no"] and o2["has_pages"] is True
+
+    # 改回无页码用字表 → 仍是变化，再出新单，且该单回查时标页码未知
+    _upload_vol(client, "册甲", "天地")
+    o3 = client.post("/api/volumes/册甲/submit").json()
+    assert o3["order_no"] not in (o1["order_no"], o2["order_no"])
+    assert o3["has_pages"] is False
+    lk = _lookup(client, no="SR-1")
+    by_no = {m["order_no"]: m for m in lk["matches"]}
+    assert by_no[o3["order_no"]]["pages_unknown"] is True
+    assert by_no[o2["order_no"]]["pages"] == ["一"]
+    assert by_no[o1["order_no"]]["pages_unknown"] is True
+
+    # 再无变化 → 复用 o3
+    o4 = client.post("/api/volumes/册甲/submit").json()
+    assert o4["order_no"] == o3["order_no"] and o4["reused"] is True
+
+
+def test_idempotency_key_retry_with_paged_table(client):
+    _lib3(client)
+    _upload_vol_paged(client, "册甲", [("一", "天")])
+    h = {"Idempotency-Key": "paged-job-1"}
+    d1 = client.post("/api/volumes/册甲/submit", headers=h).json()
+    d2 = client.post("/api/volumes/册甲/submit", headers=h).json()
+    assert d1["order_no"] == d2["order_no"] and d2["reused"] is True
+    assert d2["pages"] == d1["pages"]
+
+
+def test_failed_submit_keeps_pool_and_lookup(client):
+    _lib3(client)
+    _upload_vol_paged(client, "册甲", [("一", "天")])
+    o1 = client.post("/api/volumes/册甲/submit").json()
+    before = _lookup(client, no="SR-2")
+    assert before["match_count"] == 0
+
+    # 改稿加“地”并模拟保存失败 → 共需与回查都保持原状
+    _upload_vol_paged(client, "册甲", [("一", "天"), ("九", "地")])
+    r = client.post("/api/volumes/册甲/submit", headers={"X-Fail-Commit": "1"})
+    assert r.status_code == 500
+    after = _lookup(client, no="SR-2")
+    assert after["match_count"] == 0
+    lk1 = _lookup(client, no="SR-1")
+    assert [m["pages"] for m in lk1["matches"]] == [["一"]]
+    state = client.get("/api/state").json()
+    assert {x["glyph_char"] for x in state["shared_pool"]} == {"天"}
+    orders = client.get("/api/orders").json()
+    assert [o["order_no"] for o in orders] == [o1["order_no"]]
+
+
+def test_lookup_survives_library_replacement(client):
+    _lib3(client)
+    _upload_vol_paged(client, "册甲", [("一", "天"), ("二", "地")])
+    o1 = client.post("/api/volumes/册甲/submit").json()
+
+    # 换库：整套字库换成新库新号，旧字模不再生效
+    _upload_lib(client, [("金石斋", "重刊", "JS-1", "天"), ("金石斋", "重刊", "JS-2", "地")])
+    lk = _lookup(client, no="SR-1")
+    assert lk["in_current_library"] is False
+    assert lk["match_count"] == 1
+    assert lk["matches"][0]["order_no"] == o1["order_no"]
+    assert lk["matches"][0]["pages"] == ["一"]
+
+
+def test_lookup_uses_matrix_index(client):
+    _lib3(client)
+    _upload_vol_paged(client, "册甲", [("一", "天")])
+    client.post("/api/volumes/册甲/submit")
+    from app.database import connect
+
+    conn = connect()
+    try:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT order_no FROM order_matrix_pages "
+            "WHERE library_name='宋韵楼' AND edition='初刻' AND matrix_no='SR-1'"
+        ).fetchall()
+        detail = " ".join(str(tuple(row)) for row in plan).lower()
+        assert "idx_omp_matrix" in detail  # 按字模索引定位，不逐单扫描
+        # 归档行数：带页码单按 (字模,页) 一行
+        n = conn.execute("SELECT COUNT(*) c FROM order_matrix_pages").fetchone()["c"]
+        assert n == 1
+    finally:
+        conn.close()
+
+
+def test_paged_csv_validation_and_no_match(client):
+    _lib3(client)
+    # 页码列为空 → 400
+    r = client.post(
+        "/api/volumes/册甲/chars",
+        files={"file": ("x.csv", _csv("页码,字\n,天\n"), "text/csv")},
+    )
+    assert r.status_code == 400 and "页码为空" in r.json()["error"]
+    # 有页码列却没有字列 → 400
+    r = client.post(
+        "/api/volumes/册甲/chars",
+        files={"file": ("x.csv", _csv("页码,备注\n一,天\n"), "text/csv")},
+    )
+    assert r.status_code == 400 and "字" in r.json()["error"]
+    # 回查参数不全 → 400；无命中 → 空清单
+    assert client.get("/api/lookup?library=宋韵楼").status_code == 400
+    lk = _lookup(client, no="SR-9")
+    assert lk["match_count"] == 0 and lk["matches"] == []
+
+
+def test_order_csv_includes_page_record(client):
+    _lib3(client)
+    _upload_vol_paged(client, "册甲", [("一", "天"), ("二", "地")])
+    o = client.post("/api/volumes/册甲/submit").json()
+    text = client.get(f"/api/orders/{o['order_no']}/download").content.decode("utf-8-sig")
+    assert "逐页记录" in text and "一,天,宋韵楼,初刻,SR-1" in text

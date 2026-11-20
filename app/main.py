@@ -27,10 +27,11 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="古籍制版字模工位管理",
     description=(
-        "上传分册用字表与按优先顺序排列的字库清单；每字取第一个收录它的字库，"
-        "按字库、版次、字模号识别字模；交印出增减单，支持并发生效次序与原单复用。"
+        "上传分册用字表（可带页码）与按优先顺序排列的字库清单；每字取第一个收录它的字库，"
+        "按字库、版次、字模号识别字模；交印出增减单并归档当次实际用模的逐页记录，"
+        "支持并发生效次序、原单复用与按字模回查页码。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -61,8 +62,8 @@ async def upload_libraries(file: UploadFile = File(...)):
 @app.post("/api/volumes/{volume_name}/chars", summary="上传（替换）某册用字表")
 async def upload_volume_chars(volume_name: str, file: UploadFile = File(...)):
     data = await file.read()
-    chars = parse_volume_csv(data)
-    return service.replace_volume_chars(volume_name, chars)
+    table = parse_volume_csv(data)
+    return service.replace_volume_chars(volume_name, table.chars, table.page_rows)
 
 
 # ---------- 交印 ----------
@@ -103,6 +104,16 @@ def _order_csv(payload: dict) -> str:
         w.writerow(["减", x["library_name"], x["edition"], x["matrix_no"], x["glyph_char"]])
     w.writerow([])
     w.writerow([f"交印前共需 {len(payload['pool_before'])} 个，交印后共需 {len(payload['pool_after'])} 个"])
+    w.writerow([])
+    if payload.get("pages"):
+        w.writerow(["当次实际用模逐页记录"])
+        w.writerow(["页码", "字", "字库", "版次", "字模号"])
+        for pg in payload["pages"]:
+            for it in pg["items"]:
+                w.writerow([pg["page_no"], it["glyph_char"], it["library_name"],
+                            it["edition"], it["matrix_no"]])
+    else:
+        w.writerow(["当次实际用模逐页记录：无（该单用字表未带页码）"])
     return buf.getvalue()
 
 
@@ -117,6 +128,20 @@ def order_download(order_no: str):
             "Content-Disposition": f'attachment; filename="{order_no}.csv"'
         },
     )
+
+
+# ---------- 字模回查 ----------
+
+
+@app.get(
+    "/api/lookup",
+    summary="按 字库+版次+字模号 回查用过该字模的交印单（单号/册名/页码）",
+)
+def lookup(library: str = "", edition: str = "", matrix_no: str = ""):
+    library, edition, matrix_no = library.strip(), edition.strip(), matrix_no.strip()
+    if not (library and edition and matrix_no):
+        raise DomainError("回查需同时给出 字库、版次、字模号 三个参数")
+    return service.lookup_matrix(library, edition, matrix_no)
 
 
 # ---------- 状态 ----------

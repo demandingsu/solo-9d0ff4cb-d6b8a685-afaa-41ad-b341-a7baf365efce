@@ -1,4 +1,4 @@
-"""核心业务逻辑：字库装载、逐字取字库、交印出单。
+"""核心业务逻辑：字库装载、逐字取字库、交印出单、按字模回查页码。
 
 规则要点
 --------
@@ -7,8 +7,11 @@
 3. 比对交印前后“各册共需的字模（并集）”生成增减单。
 4. 交印事务串行化（BEGIN IMMEDIATE + 库内应用级互斥锁），逐单生效，
    每单提交前后都校验并集与各册清单一致。
-5. 重复确认同一笔交印复用原单，按单号可原样重取。
-6. 缺字或保存失败时回滚，仍沿用原清单。
+5. 用字表可带「页码、字」两列；交印单与当次实际用模的逐页记录一同入档，
+   改稿或换库后仍能按字模回查当时的单号、册名与页码（无页码单标“页码未知”）。
+6. 重复确认同一笔交印（稿件与用模都未变）复用原单；用字所在页有变化，
+   即使用模相同也出新单；按单号可原样重取。
+7. 缺字或保存失败时回滚，仍沿用原清单，共需并集与回查结果都保持原状。
 """
 from __future__ import annotations
 
@@ -107,8 +110,15 @@ def _get_or_create_volume(conn: sqlite3.Connection, name: str) -> int:
     return cur.lastrowid
 
 
-def replace_volume_chars(volume_name: str, chars: list[str]) -> dict:
-    """全量替换某册用字表（不动已交印的字模清单，交印时才重算）。"""
+def replace_volume_chars(
+    volume_name: str,
+    chars: list[str],
+    page_rows: list[tuple[str, str]] | None = None,
+) -> dict:
+    """全量替换某册用字表（不动已交印的字模清单，交印时才重算）。
+
+    page_rows 为 (页码, 字) 逐行记录；None/空表示无页码用字表。
+    """
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -118,13 +128,41 @@ def replace_volume_chars(volume_name: str, chars: list[str]) -> dict:
             "INSERT INTO volume_chars(volume_id, glyph_char, source_order) VALUES (?,?,?)",
             [(volume_id, ch, i) for i, ch in enumerate(chars)],
         )
+        conn.execute("DELETE FROM volume_char_pages WHERE volume_id=?", (volume_id,))
+        if page_rows:
+            conn.executemany(
+                "INSERT INTO volume_char_pages(volume_id, glyph_char, page_no, "
+                "source_order) VALUES (?,?,?,?)",
+                [(volume_id, ch, page, i) for i, (page, ch) in enumerate(page_rows)],
+            )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    return {"volume": volume_name, "char_count": len(chars), "updated_at": _now_iso()}
+    return {
+        "volume": volume_name,
+        "char_count": len(chars),
+        "page_count": len({p for p, _ in (page_rows or [])}),
+        "paged": bool(page_rows),
+        "updated_at": _now_iso(),
+    }
+
+
+def _load_page_map(conn: sqlite3.Connection, volume_id: int) -> dict[str, list[str]]:
+    """该册当前用字表的 字 -> 页码列表（无页码表时为空 dict）。"""
+    rows = conn.execute(
+        "SELECT glyph_char, page_no FROM volume_char_pages "
+        "WHERE volume_id=? ORDER BY source_order",
+        (volume_id,),
+    ).fetchall()
+    pages: dict[str, list[str]] = {}
+    for r in rows:
+        bucket = pages.setdefault(r["glyph_char"], [])
+        if r["page_no"] not in bucket:
+            bucket.append(r["page_no"])
+    return pages
 
 
 def _resolve_char(conn: sqlite3.Connection, ch: str) -> dict | None:
@@ -178,19 +216,46 @@ def _load_pool(conn: sqlite3.Connection, exclude_volume: int | None = None) -> l
     return [_identity(r) for r in rows]
 
 
-def _fingerprint(volume_id: int, chars: list[str], target: list[dict]) -> str:
-    """同一笔交印的判重指纹：同册、同用字、同解析目标字模。"""
-    raw = json.dumps(
-        {
-            "volume_id": volume_id,
-            "chars": chars,
-            "target": _sorted_idents(target),
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+def _fingerprint(
+    volume_id: int,
+    chars: list[str],
+    page_map: dict[str, list[str]],
+    target: list[dict],
+) -> str:
+    """同一笔交印的判重指纹：同册、同用字、同页码分布、同解析目标字模。
+
+    无页码表的指纹与旧版格式一致（旧单升级后仍能命中复用）；
+    有页码时把 字->页码 一并纳入——用字所在页有变化即视为另一笔。
+    """
+    doc: dict = {
+        "volume_id": volume_id,
+        "chars": chars,
+        "target": _sorted_idents(target),
+    }
+    if page_map:
+        doc["pages"] = {ch: sorted(ps) for ch, ps in page_map.items()}
+    raw = json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _build_page_record(
+    resolved_by_char: dict[str, dict],
+    page_map: dict[str, list[str]],
+) -> list[dict] | None:
+    """当次实际用模的逐页记录：[{page_no, items:[字模身份+字]}]，按页码出现顺序。"""
+    if not page_map:
+        return None
+    by_page: dict[str, list[dict]] = {}
+    for ch, pages in page_map.items():
+        ident = resolved_by_char.get(ch)
+        if ident is None:
+            continue
+        for page_no in pages:
+            by_page.setdefault(page_no, []).append(_identity(ident))
+    return [
+        {"page_no": page_no, "items": _sorted_idents(items)}
+        for page_no, items in by_page.items()
+    ]
 
 
 def _assert_pool_consistent(conn: sqlite3.Connection, stage: str) -> None:
@@ -252,6 +317,7 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
         ]
         if not chars:
             raise DomainError(f"册“{volume_name}”的用字表为空", 404)
+        page_map = _load_page_map(conn, volume_id)
 
         # 2. 逐字取第一个收录它的字库；有缺字则整体失败，沿用原清单
         resolved: list[dict] = []
@@ -274,16 +340,21 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
         before_keys = {_ident_key(x) for x in before_idents}
         target_keys = {_ident_key(x) for x in after_idents}
 
-        # 3. 无幂等键时的重复确认：同册、同用字、解析目标与当前已交印清单
-        #    完全相同（即没有任何变化）时，复用该册最近一笔原单
-        fp = _fingerprint(volume_id, chars, after_idents)
+        # 当次实际用模的逐页记录（无页码表则为 None）
+        resolved_by_char = {x["glyph_char"]: x for x in resolved}
+        page_record = _build_page_record(resolved_by_char, page_map)
+
+        # 3. 无幂等键时的重复确认：同册、同用字、同页码分布、解析目标与
+        #    当前已交印清单完全相同（稿件与用模都未变）时，复用该册最近一笔原单。
+        #    用字所在页有变化（含补上页码 / 改回无页码表）即指纹不同，出新单。
+        fp = _fingerprint(volume_id, chars, page_map, after_idents)
         if not idem_key and before_keys == target_keys:
             old = conn.execute(
-                "SELECT payload_json FROM orders "
+                "SELECT fingerprint, payload_json FROM orders "
                 "WHERE volume_id=? ORDER BY seq DESC LIMIT 1",
                 (volume_id,),
             ).fetchone()
-            if old is not None:
+            if old is not None and old["fingerprint"] == fp:
                 payload = json.loads(old["payload_json"])
                 payload["reused"] = True
                 conn.rollback()
@@ -323,6 +394,8 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
             "reused": False,
             "fingerprint": fp,
             "effective_at": _now_iso(),
+            "has_pages": page_record is not None,
+            "pages": page_record,
             "pool_before": pool_before,
             "pool_after": pool_after,
             "added": added,
@@ -342,6 +415,28 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
                 fp,
                 json.dumps(payload, ensure_ascii=False),
             ),
+        )
+
+        # 随单归档当次实际用模记录（同事务，失败一起回滚）：
+        # 有页码 → 逐 (字模, 页码) 一行；无页码 → 逐字模一行、page_no 为 NULL。
+        if page_record is not None:
+            archive_rows = [
+                (order_no, next_seq, volume_name, it["library_name"], it["edition"],
+                 it["matrix_no"], it["glyph_char"], pg["page_no"])
+                for pg in page_record
+                for it in pg["items"]
+            ]
+        else:
+            archive_rows = [
+                (order_no, next_seq, volume_name, x["library_name"], x["edition"],
+                 x["matrix_no"], x["glyph_char"], None)
+                for x in after_idents
+            ]
+        conn.executemany(
+            "INSERT INTO order_matrix_pages(order_no, seq, volume_name, "
+            "library_name, edition, matrix_no, glyph_char, page_no) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            archive_rows,
         )
 
         if fail_commit:
@@ -402,9 +497,77 @@ def list_orders(volume_name: str | None = None) -> list[dict]:
                     "created_at": r["created_at"],
                     "added_count": len(p["added"]),
                     "removed_count": len(p["removed"]),
+                    "has_pages": bool(p.get("has_pages")),
                 }
             )
         return result
+    finally:
+        conn.close()
+
+
+def lookup_matrix(library_name: str, edition: str, matrix_no: str) -> dict:
+    """按 (字库, 版次, 字模号) 回查：哪些交印单、哪一册、哪几页用过该字模。
+
+    命中 order_matrix_pages 的 (字库, 版次, 字模号) 索引，无需逐单扫描；
+    无页码单（page_no 为 NULL）一并列出并标 pages_unknown（页码未知）。
+    """
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.order_no, p.seq, p.volume_name, p.glyph_char, p.page_no,
+                   o.created_at
+            FROM order_matrix_pages p
+            JOIN orders o ON o.order_no = p.order_no
+            WHERE p.library_name=? AND p.edition=? AND p.matrix_no=?
+            ORDER BY p.seq, p.id
+            """,
+            (library_name, edition, matrix_no),
+        ).fetchall()
+        matches: list[dict] = []
+        by_order: dict[str, dict] = {}
+        glyph_char: str | None = None
+        for r in rows:
+            glyph_char = glyph_char or r["glyph_char"]
+            m = by_order.get(r["order_no"])
+            if m is None:
+                m = {
+                    "order_no": r["order_no"],
+                    "seq": r["seq"],
+                    "volume": r["volume_name"],
+                    "created_at": r["created_at"],
+                    "pages": [],
+                    "pages_unknown": False,
+                }
+                by_order[r["order_no"]] = m
+                matches.append(m)
+            if r["page_no"] is None:
+                m["pages_unknown"] = True
+            elif r["page_no"] not in m["pages"]:
+                m["pages"].append(r["page_no"])
+        for m in matches:
+            if m["pages_unknown"]:
+                m["pages"] = None  # 无页码单：页码未知
+        in_current = conn.execute(
+            """
+            SELECT g.glyph_char FROM glyphs g
+            JOIN libraries l ON l.library_id = g.library_id
+            WHERE l.name=? AND l.edition=? AND g.matrix_no=? AND l.current=1
+            """,
+            (library_name, edition, matrix_no),
+        ).fetchone()
+        return {
+            "query": {
+                "library_name": library_name,
+                "edition": edition,
+                "matrix_no": matrix_no,
+            },
+            "glyph_char": glyph_char
+            or (in_current["glyph_char"] if in_current else None),
+            "in_current_library": in_current is not None,
+            "match_count": len(matches),
+            "matches": matches,
+        }
     finally:
         conn.close()
 
@@ -430,9 +593,16 @@ def get_state() -> dict:
                     (v["volume_id"],),
                 ).fetchall()
             ]
+            char_pages = _load_page_map(conn, v["volume_id"])
             active = _load_active_identities(conn, v["volume_id"])
             volumes.append(
-                {"volume": v["name"], "chars": chars, "active_matrices": active}
+                {
+                    "volume": v["name"],
+                    "chars": chars,
+                    "char_pages": char_pages,
+                    "paged": bool(char_pages),
+                    "active_matrices": active,
+                }
             )
         pool = _load_pool(conn)
         return {"libraries": libs, "volumes": volumes, "shared_pool": pool}
@@ -446,8 +616,10 @@ def reset_all() -> None:
     try:
         conn.execute("BEGIN IMMEDIATE")
         for table in (
+            "order_matrix_pages",
             "orders",
             "active_matrices",
+            "volume_char_pages",
             "volume_chars",
             "volumes",
             "glyphs",
